@@ -1,0 +1,221 @@
+name: Build Offline Android APK (Amar Hisab)
+
+on:
+  push:
+    branches:
+      - main
+      - master
+      - develop
+    tags-ignore:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-android-apk:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Setup Java 21 (Required for Capacitor 8 & Gradle)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Configure Android SDK & Accept Licenses
+        run: |
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "$SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
+
+          mkdir -p "$SDK_ROOT/licenses"
+          printf "\n8933bad161af4178b1185d1a37fbf41ea5269c55\nd56f5187479451eabf01fb78af6dfcb131a6481e\n24333f8a63b6825ea9c5514f83c2829b004d1fee\n85435445a95c234340d05367a999a69d7b46701c\n" > "$SDK_ROOT/licenses/android-sdk-license"
+          printf "\n84831b9409646a918e30573bab4c9c91346d8abd\n504667f4c0de7af1a06de9f4b1727b84351f2910\n" > "$SDK_ROOT/licenses/android-sdk-preview-license"
+
+          SDKMANAGER=$(find "$SDK_ROOT/cmdline-tools" -name sdkmanager -type f 2>/dev/null | sort -V | tail -n 1 || true)
+          if [ -n "$SDKMANAGER" ]; then
+            echo "$(dirname "$SDKMANAGER")" >> "$GITHUB_PATH"
+            yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses > /dev/null 2>&1 || true
+            "$SDKMANAGER" --sdk_root="$SDK_ROOT" "platform-tools" "platforms;android-36" "build-tools;36.0.0" || true
+          fi
+
+      - name: Install NPM Dependencies
+        run: npm install --legacy-peer-deps
+
+      - name: Sync 1024x1024 App Icon & White Splash Assets
+        run: |
+          node --input-type=module -e '
+            import fs from "node:fs";
+            import sharp from "sharp";
+
+            fs.mkdirSync("assets", { recursive: true });
+            const sourceIcon = fs.existsSync("assets/icon-only.png")
+              ? "assets/icon-only.png"
+              : "public/icon.png";
+
+            if (fs.existsSync(sourceIcon)) {
+              if (sourceIcon !== "public/icon.png") {
+                await sharp(sourceIcon)
+                  .resize(1024, 1024)
+                  .png({ compressionLevel: 9 })
+                  .toFile("public/icon.png");
+              }
+              if (!fs.existsSync("assets/icon-only.png")) {
+                await sharp(sourceIcon).resize(1024, 1024).png().toFile("assets/icon-only.png");
+              }
+              if (!fs.existsSync("assets/icon-foreground.png")) {
+                await sharp(sourceIcon).resize(1024, 1024).png().toFile("assets/icon-foreground.png");
+              }
+              if (!fs.existsSync("assets/icon-background.png")) {
+                await sharp({
+                  create: { width: 1024, height: 1024, channels: 4, background: { r: 37, g: 36, b: 42, alpha: 1 } }
+                }).png().toFile("assets/icon-background.png");
+              }
+              if (!fs.existsSync("assets/splash.png")) {
+                const iconBuf = await sharp(sourceIcon).resize(480, 480).png().toBuffer();
+                await sharp({
+                  create: { width: 2732, height: 2732, channels: 4, background: { r: 255, g: 255, b: 255, alpha: 1 } }
+                })
+                  .composite([{ input: iconBuf, gravity: "center" }])
+                  .png()
+                  .toFile("assets/splash.png");
+              }
+              if (!fs.existsSync("assets/splash-dark.png")) {
+                fs.copyFileSync("assets/splash.png", "assets/splash-dark.png");
+              }
+
+              await sharp(sourceIcon).resize(512, 512).png().toFile("public/pwa-512x512.png");
+              await sharp(sourceIcon).resize(512, 512).png().toFile("public/pwa-maskable-512x512.png");
+              await sharp(sourceIcon).resize(192, 192).png().toFile("public/pwa-192x192.png");
+              await sharp(sourceIcon).resize(180, 180).png().toFile("public/apple-touch-icon.png");
+            }
+          '
+
+      - name: Build Production Offline Web Bundle
+        run: |
+          npm run build
+          rm -rf dist/__deliverables__ dist/assets/aistudio
+
+      - name: Add Capacitor Android Platform
+        run: |
+          if [ ! -d "android" ]; then
+            npx cap add android
+          fi
+          printf "sdk.dir=%s\n" "$ANDROID_HOME" > android/local.properties
+
+      - name: Generate Native Android Launcher Icons & White Splash Screen
+        run: |
+          npx capacitor-assets generate --android \
+            --iconBackgroundColor '#25242A' \
+            --iconBackgroundColorDark '#25242A' \
+            --splashBackgroundColor '#FFFFFF' \
+            --splashBackgroundColorDark '#FFFFFF'
+
+      - name: Configure Offline Android Permissions in AndroidManifest.xml
+        run: |
+          python3 - << 'PY'
+          from pathlib import Path
+          manifest_path = Path("android/app/src/main/AndroidManifest.xml")
+          text = manifest_path.read_text(encoding="utf-8")
+
+          required_permissions = [
+              '<uses-permission android:name="android.permission.CAMERA" />',
+              '<uses-permission android:name="android.permission.POST_NOTIFICATIONS" />',
+              '<uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />',
+              '<uses-permission android:name="android.permission.USE_EXACT_ALARM" />',
+              '<uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />',
+              '<uses-permission android:name="android.permission.VIBRATE" />',
+              '<uses-permission android:name="android.permission.WAKE_LOCK" />',
+              '<uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />',
+              '<uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />',
+              '<uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />',
+              '<uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" />',
+          ]
+
+          missing = []
+          for perm in required_permissions:
+              perm_name = perm.split('android:name="')[1].split('"')[0]
+              if perm_name not in text:
+                  missing.append("    " + perm)
+
+          if 'android.hardware.camera' not in text:
+              missing.append('    <uses-feature android:name="android.hardware.camera" android:required="false" />')
+
+          if missing:
+              block = "\n".join(missing) + "\n"
+              text = text.replace("</manifest>", block + "</manifest>")
+              manifest_path.write_text(text, encoding="utf-8")
+              print("Injected permissions:", len(missing))
+          PY
+
+      - name: Sync Web Bundle & Plugins to Android
+        run: npx cap sync android
+
+      - name: Build & Sign Release APK
+        run: |
+          rm -f amar-hisab-release.keystore amar-hisab-aligned.apk amar-hisab.apk
+
+          keytool -genkeypair -v \
+            -keystore amar-hisab-release.keystore \
+            -alias amarhisab \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -storepass amarhisab123 \
+            -keypass amarhisab123 \
+            -dname "CN=Amar Hisab, OU=Finance, O=Wadud, L=Dhaka, S=Dhaka, C=BD"
+
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon
+          cd ..
+
+          UNSIGNED_APK=$(find android/app/build/outputs/apk/release -name "*.apk" | head -n 1)
+          BUILD_TOOLS_DIR=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)
+
+          "$BUILD_TOOLS_DIR/zipalign" -v -p 4 "$UNSIGNED_APK" amar-hisab-aligned.apk
+          "$BUILD_TOOLS_DIR/apksigner" sign \
+            --ks amar-hisab-release.keystore \
+            --ks-key-alias amarhisab \
+            --ks-pass pass:amarhisab123 \
+            --key-pass pass:amarhisab123 \
+            --out amar-hisab.apk \
+            amar-hisab-aligned.apk
+          "$BUILD_TOOLS_DIR/apksigner" verify --verbose amar-hisab.apk
+          ls -lh amar-hisab.apk
+
+      - name: Upload Ready-to-Install APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: amar-hisab-apk
+          path: amar-hisab.apk
+          if-no-files-found: error
+
+      - name: Upload Demo Data JSON Artifact (For Testing Only)
+        if: hashFiles('demo-data/amar-hisab-demo-data.json') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: amar-hisab-demo-data
+          path: demo-data/amar-hisab-demo-data.json
+
+      - name: Publish GitHub Release with APK
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        continue-on-error: true
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: Amar Hisab Offline APK v1.0.${{ github.run_number }}
+          files: |
+            amar-hisab.apk
+            demo-data/amar-hisab-demo-data.json
